@@ -104,8 +104,17 @@ fn invalidate_block(block_hash: &str) {
  *
  * Uses the Regtest DB Snapshot Rewind Pattern to force Node A to broadcast a
  * revoked commitment transaction, verifying breach detection, the justice sweep,
- * and BTC balance movement: funds are detracted from the cheater (Node A) and
- * credited to the honest node (Node B).
+ * and full punishment: BOTH the BTC and the RGB assets that were locked in the
+ * channel move from the cheater (Node A) to the honest node (Node B).
+ *
+ * The revoked state (State 1) is snapshotted AFTER an RGB-moving payment, so
+ * Node A's to_local allocation under State 1 genuinely holds RGB units (not
+ * zero). This is deliberate: the claim under test is that the justice sweep
+ * lets Node B claim Node A's revoked allocation too, not just settle on
+ * whatever Node B already held. A snapshot taken before any RGB ever moved
+ * cannot distinguish "the sweep transferred the cheater's RGB" from "RGB
+ * clawback isn't implemented" — both look identical when the cheater's stake
+ * was zero to begin with.
  */
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -144,7 +153,7 @@ async fn test_revoked_commitment_breach_sweeps_to_local() {
     )
     .await;
 
-    // Open channel (State 1) — 100 000 sat capacity, 600 RGB units on Node A's side
+    // Open channel — 100 000 sat capacity, 600 RGB units on Node A's side
     let channel = open_channel(
         node1_addr,
         &node2_pubkey,
@@ -156,8 +165,24 @@ async fn test_revoked_commitment_breach_sweeps_to_local() {
     )
     .await;
 
-    // Snapshot State 1: gracefully shut down Node A so the DB is in a clean state,
-    // then copy the directory before any further state advances.
+    // Split the RGB before snapshotting: Node A pays Node B 300 units, so the
+    // state we are about to snapshot and later revoke (State 1) already has a
+    // genuine stake on Node A's side (300) that Node B has no claim to yet.
+    keysend_with_ln_balance(
+        node1_addr,
+        node2_addr,
+        &node2_pubkey,
+        Some(6_000_000),
+        Some(&asset_id),
+        Some(300),
+        Some(600),
+        Some(0),
+    )
+    .await;
+
+    // Snapshot State 1 (Node A=300, Node B=300 RGB in-channel): gracefully shut
+    // down Node A so the DB is in a clean state, then copy the directory before
+    // any further state advances.
     shutdown(&[node1_addr]).await;
 
     let backup_dir = format!("{test_dir_base}node1_backup");
@@ -177,7 +202,8 @@ async fn test_revoked_commitment_breach_sweeps_to_local() {
     )
     .await;
 
-    // Advance to State 2 (this revokes State 1 on both sides)
+    // Advance to State 2 (Node A=200, Node B=400 RGB in-channel) — this revokes
+    // State 1 on both sides.
     keysend_with_ln_balance(
         node1_addr,
         node2_addr,
@@ -185,8 +211,8 @@ async fn test_revoked_commitment_breach_sweeps_to_local() {
         Some(6_000_000),
         Some(&asset_id),
         Some(100),
-        Some(600),
-        Some(0),
+        Some(300),
+        Some(300),
     )
     .await;
 
@@ -259,13 +285,40 @@ async fn test_revoked_commitment_breach_sweeps_to_local() {
         100_000 - max_expected_fee_sat
     );
 
-    // The justice sweep confirms Node B's hold on the entirety of the revoked channel
-    // funds. RGB balance is genuinely 0: the cheater (Node A) broadcast State 1, under
-    // which Node B held 0 units of the asset (all 600 were on Node A's side). The honest
-    // node is compensated through the on-chain BTC penalty sweep, NOT through an RGB
-    // transfer — this is the crucial distinction between BTC-level justice and the
-    // RGB-lib accounting layer (tested separately in test_rgb_database_uncoupled...).
-    wait_for_balance(node2_addr, &asset_id, 0).await;
+    // --- RGB Full-Punishment Proof ---
+    // Under the revoked State 1 commitment, Node A's to_local allocation held 300
+    // RGB units and Node B's to_remote allocation held the other 300. "Full
+    // punishment" means Node B's justice sweep must claim BOTH: not just the 300
+    // units Node B could already claim honestly, but also the 300 units that were
+    // on the cheater's (Node A's) side. If the sweep only restores Node B's own
+    // share, RGB-level punishment isn't actually happening — the BTC-layer penalty
+    // transaction is not carrying the RGB ownership transfer with it.
+    const NODE_B_RIGHTFUL_SHARE: u64 = 300;
+    const NODE_A_PUNITIVELY_SEIZED_SHARE: u64 = 300;
+    const FULL_PUNISHED_POT: u64 = NODE_B_RIGHTFUL_SHARE + NODE_A_PUNITIVELY_SEIZED_SHARE;
+
+    let t_0 = std::time::Instant::now();
+    let mut node2_asset_after = asset_balance_spendable(node2_addr, &asset_id).await;
+    while node2_asset_after < FULL_PUNISHED_POT {
+        if t_0.elapsed().as_secs() > 90 {
+            break;
+        }
+        mine(false);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        refresh_transfers_tolerant(node2_addr).await;
+        node2_asset_after = asset_balance_spendable(node2_addr, &asset_id).await;
+    }
+    assert_eq!(
+        node2_asset_after, FULL_PUNISHED_POT,
+        "Node B should recover the FULL RGB pot from the revoked channel: its own \
+         {NODE_B_RIGHTFUL_SHARE} units plus the {NODE_A_PUNITIVELY_SEIZED_SHARE} \
+         units punitively seized from Node A's revoked allocation (found \
+         {node2_asset_after}). If this is short by exactly \
+         {NODE_A_PUNITIVELY_SEIZED_SHARE}, the on-chain BTC penalty sweep is NOT \
+         transferring RGB ownership of the cheater's allocation, and the 'full \
+         punishment, not limited to the bitcoin amount' guarantee does not \
+         currently hold end-to-end."
+    );
 
     // --- Breach event fully drained proof ---
     // After the sweep, Node B's ChannelMonitor must have an empty pending event queue:
@@ -289,19 +342,37 @@ async fn test_revoked_commitment_breach_sweeps_to_local() {
     );
 
     shutdown(&[node2_addr]).await;
+
+    // --- Cheater Forfeiture Proof ---
+    // Node A must not recover any of the 600 RGB units it locked into the
+    // channel: full punishment means Node A ends up with exactly what it had
+    // before opening the channel (400, since 1000 were issued and 600 went into
+    // the channel), not a partial refund of its revoked 300-unit allocation.
+    let (node1_addr, _) = start_node(&test_dir_node1, NODE1_PEER_PORT, true).await;
+    let node1_asset_after = asset_balance_spendable(node1_addr, &asset_id).await;
+    assert_eq!(
+        node1_asset_after, 400,
+        "Node A (the cheater) must not recover any of the 600 RGB units it \
+         locked into the channel (found {node1_asset_after} spendable, expected \
+         the pre-channel baseline of 400)"
+    );
+    shutdown(&[node1_addr]).await;
 }
 
-/** 2. test_revoked_htlc_breach_sweeps_htlcs()
+/** 2. test_bolt5_penalty_input_weight_constants_are_self_consistent()
  *
- * Pure in-memory unit test pinning the BOLT #5 penalty-input weight constants for
- * to_local / offered-HTLC / accepted-HTLC penalty inputs. These are the maximum
- * (spec-prescribed) weights used to estimate the justice-transaction feerate when
- * sweeping multiple revoked outputs. No node daemons, peer ports, or chain access
- * are required: the assertions validate local constant pinning, spec arithmetic
- * (witness bytes + 164 WU non-witness base), and script weight ordering.
+ * NOT a breach or sweep test: no node, channel, HTLC, or chain access is
+ * involved. This is a pure in-memory unit test pinning the BOLT #5
+ * penalty-input weight constants for to_local / offered-HTLC / accepted-HTLC
+ * penalty inputs against each other and against locally-pinned reference
+ * values — it cannot detect a regression in LDK's actual weight calculation
+ * (`lightning::chain::package` is `pub(crate)` and unreachable from here), only
+ * a drift in this file's own constants. See
+ * `test_revoked_commitment_breach_sweeps_to_local` for the real breach/sweep
+ * coverage, which does not yet include a live HTLC in flight.
  */
 #[test]
-fn test_revoked_htlc_breach_sweeps_htlcs() {
+fn test_bolt5_penalty_input_weight_constants_are_self_consistent() {
     // BOLT #5 Section 5 – Penalty Transaction Weight:
     //   to_local penalty input:       324 wu
     //   offered HTLC penalty input:   407 wu
@@ -392,19 +463,19 @@ fn test_revoked_htlc_breach_sweeps_htlcs() {
 }
 
 /**
- * 3. test_second_stage_htlc_breach()
+ * 3. test_signer_ready_for_second_stage_htlc_signing()
  *
- * Verifies that the node signer is always functional for second-stage HTLC paths
- * (HTLC-Success / HTLC-Timeout) and that the channel monitor infrastructure is
- * present and able to derive the revocation key needed to sweep a second-stage
- * breach. This test exercises the signing path without requiring a live HTLC to
- * be in-flight (which would require a live regtest lightning payment at a precise
- * unresolved state).
+ * NOT a breach test: no HTLC is ever put in flight and no revoked commitment is
+ * ever broadcast. This checks that the node signer and monitor infrastructure
+ * that a second-stage (HTLC-Success/HTLC-Timeout) justice signature would rely
+ * on are present and functional on an ordinary open channel. See
+ * `test_revoked_commitment_with_pending_htlc_sweeps_htlc_output` for the real
+ * breach-with-an-HTLC-in-flight coverage.
  */
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[traced_test]
-async fn test_second_stage_htlc_breach() {
+async fn test_signer_ready_for_second_stage_htlc_signing() {
     initialize();
 
     let test_dir_base = format!("{TEST_DIR_BASE}second_stage_htlc/");
@@ -508,6 +579,198 @@ async fn test_second_stage_htlc_breach() {
     );
 
     shutdown(&[node1_addr, node2_addr]).await;
+}
+
+/**
+ * 3b. test_revoked_commitment_with_pending_htlc_sweeps_htlc_output()
+ *
+ * The real HTLC-in-flight breach that `test_signer_ready_for_second_stage_htlc_signing`
+ * did not exercise. Combines the pending-HTLC hold trick from
+ * `close_force_pending_htlc` with the Regtest DB Snapshot Rewind Pattern from
+ * `test_revoked_commitment_breach_sweeps_to_local`: Node B is set to hold an
+ * incoming RGB-colored payment claimable (so it stays pending, unresolved, and
+ * present as a dedicated HTLC output in the commitment), Node A is snapshotted
+ * with that HTLC still outstanding, a further payment revokes the snapshot, and
+ * Node A is rewound and force-closed. The broadcast commitment therefore
+ * genuinely carries three outputs: Node A's to_local, Node B's to_remote, and
+ * the pending offered-HTLC output — and the justice sweep must claim all three,
+ * including the RGB units coloring the HTLC output itself, for Node B to end up
+ * with the full channel pot.
+ */
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[traced_test]
+async fn test_revoked_commitment_with_pending_htlc_sweeps_htlc_output() {
+    initialize();
+    set_mock_fee(3000);
+
+    let test_dir_base = format!("{TEST_DIR_BASE}revoked_commitment_pending_htlc/");
+    let test_dir_node1 = format!("{test_dir_base}node1");
+    let test_dir_node2 = format!("{test_dir_base}node2");
+
+    if Path::new(&test_dir_base).exists() {
+        std::fs::remove_dir_all(&test_dir_base).unwrap();
+    }
+
+    let (node1_addr, _) = start_node(&test_dir_node1, NODE1_PEER_PORT, false).await;
+    let (node2_addr, _) = start_node(&test_dir_node2, NODE2_PEER_PORT, false).await;
+
+    fund_and_create_utxos(node1_addr, None).await;
+    fund_and_create_utxos(node2_addr, None).await;
+
+    let node2_btc_before = btc_balance(node2_addr).await.vanilla.spendable;
+
+    let asset_id = issue_asset_nia(node1_addr).await.asset_id;
+    let node2_pubkey = node_info(node2_addr).await.pubkey;
+
+    connect_peer(
+        node1_addr,
+        &node2_pubkey,
+        &format!("127.0.0.1:{NODE2_PEER_PORT}"),
+    )
+    .await;
+
+    let channel = open_channel(
+        node1_addr,
+        &node2_pubkey,
+        Some(NODE2_PEER_PORT),
+        Some(100000),
+        Some(50000000),
+        Some(600),
+        Some(&asset_id),
+    )
+    .await;
+
+    // Node B holds the incoming payment claimable: the 10-unit RGB HTLC stays
+    // pending, present as its own output in the next commitment rather than
+    // being folded back into either party's to_local/to_remote balance.
+    HELD_PAYMENT_CLAIMABLE_COUNT.store(0, Ordering::SeqCst);
+    let _hold_guard = NodeOverrideGuard::set(&HOLD_PAYMENT_CLAIMABLE_ON_NODE, &node2_pubkey);
+
+    let LNInvoiceResponse { invoice } = ln_invoice(
+        node2_addr,
+        Some(HTLC_MIN_MSAT),
+        Some(&asset_id),
+        Some(10),
+        900,
+    )
+    .await;
+    send_payment_raw(node1_addr, invoice).await;
+    let t_0 = std::time::Instant::now();
+    while HELD_PAYMENT_CLAIMABLE_COUNT.load(Ordering::SeqCst) == 0 {
+        if t_0.elapsed().as_secs() > 40 {
+            panic!("Node B did not receive the payment to hold");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    // Snapshot State 1 (Node A=600, HTLC=10 offered to Node B and pending,
+    // Node B=0): shut down Node A cleanly, then copy its directory.
+    shutdown(&[node1_addr]).await;
+
+    let backup_dir = format!("{test_dir_base}node1_backup");
+    if Path::new(&backup_dir).exists() {
+        std::fs::remove_dir_all(&backup_dir).unwrap();
+    }
+    copy_dir_all(&test_dir_node1, &backup_dir).unwrap();
+
+    let (node1_addr, _) = start_node(&test_dir_node1, NODE1_PEER_PORT, true).await;
+    connect_peer(
+        node1_addr,
+        &node2_pubkey,
+        &format!("127.0.0.1:{NODE2_PEER_PORT}"),
+    )
+    .await;
+
+    // Advance to State 2, revoking State 1, while the held HTLC stays pending
+    // and unresolved throughout (Node B never claims or fails it). Node B is
+    // still holding EVERY claimable payment (not just the first), so this
+    // second payment cannot be waited on for success — it would never settle.
+    // Adding it still forces a new commitment_signed/revoke_and_ack round trip
+    // (which is all that's needed to revoke State 1), regardless of whether
+    // it ever resolves.
+    keysend_raw(node1_addr, &node2_pubkey, Some(3_000_000), None, None).await;
+
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    shutdown(&[node1_addr, node2_addr]).await;
+
+    std::fs::remove_dir_all(&test_dir_node1).unwrap();
+    copy_dir_all(&backup_dir, &test_dir_node1).unwrap();
+
+    let (node1_addr, _) = start_node(&test_dir_node1, NODE1_PEER_PORT, true).await;
+
+    // Force-close from Node A — broadcasts the revoked State 1 commitment,
+    // which must carry the pending HTLC as a dedicated output.
+    let payload = CloseChannelRequest {
+        channel_id: channel.channel_id.clone(),
+        peer_pubkey: node2_pubkey.clone(),
+        force: true,
+    };
+    let res = reqwest::Client::new()
+        .post(format!("http://{node1_addr}/closechannel"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    check_response_is_ok(res).await;
+
+    // Confirm the revoked commitment tx. (wait_for_funding_spend_txid isn't used
+    // here: it watches for the chain-scan-detected "closed by funding output
+    // spend" log line, which fires on the side that discovers someone else's
+    // broadcast — Node A is the one that initiated this close, so its own
+    // monitor transitions via HolderForceClosed instead and never logs that
+    // line. The HTLC-output claim is instead verified empirically below, via
+    // Node B's post-sweep RGB balance.)
+    mine_n_blocks(true, 6);
+
+    shutdown(&[node1_addr]).await;
+
+    let (node2_addr, _) = start_node(&test_dir_node2, NODE2_PEER_PORT, true).await;
+
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    mine(false);
+    mine_n_blocks(true, 10);
+
+    // Node B's BTC must have grown: the sweep must include not just the
+    // to_local/to_remote split but also whatever the HTLC output carried.
+    let node2_btc_after = wait_for_btc_balance_above(node2_addr, node2_btc_before + 1_000).await;
+    assert!(
+        node2_btc_after > node2_btc_before,
+        "Node B should have MORE BTC after sweeping the revoked commitment, \
+         including its HTLC output (before={node2_btc_before}, \
+         after={node2_btc_after})"
+    );
+
+    // --- RGB HTLC Clawback Proof ---
+    // The full channel pot (600) is split at the moment of the breach as: 590
+    // in Node A's to_local, 10 in the still-pending offered-HTLC output, 0 in
+    // Node B's to_remote. If the justice sweep only claims to_local/to_remote
+    // and leaves the HTLC output's RGB coloring behind (or returns it to Node
+    // A once the HTLC times out, as ordinary HTLC-timeout semantics would),
+    // Node B ends up short by exactly the 10-unit HTLC. Full punishment
+    // requires Node B to end up with the entire 600.
+    const FULL_PUNISHED_POT: u64 = 600;
+    let t_0 = std::time::Instant::now();
+    let mut node2_asset_after = asset_balance_spendable(node2_addr, &asset_id).await;
+    while node2_asset_after < FULL_PUNISHED_POT {
+        if t_0.elapsed().as_secs() > 90 {
+            break;
+        }
+        mine(false);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        refresh_transfers_tolerant(node2_addr).await;
+        node2_asset_after = asset_balance_spendable(node2_addr, &asset_id).await;
+    }
+    assert_eq!(
+        node2_asset_after, FULL_PUNISHED_POT,
+        "Node B should recover the full RGB pot ({FULL_PUNISHED_POT}) including \
+         the RGB units that were colouring the still-pending HTLC output on the \
+         revoked commitment (found {node2_asset_after})"
+    );
+
+    shutdown(&[node2_addr]).await;
 }
 
 /**
