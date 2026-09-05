@@ -132,6 +132,17 @@ impl EcdsaChannelSigner for DynRlnChannelSigner {
         )
     }
 
+    fn color_justice_claim(&self, tx: &mut Transaction, rgb_payment: (rgb_lib::ContractId, u64)) {
+        self.inner.color_justice_claim(tx, rgb_payment)
+    }
+
+    fn get_rgb_transfer_info(
+        &self,
+        txid: &Txid,
+    ) -> Option<lightning::rgb_utils::TransferInfo> {
+        self.inner.get_rgb_transfer_info(txid)
+    }
+
     fn sign_justice_revoked_htlc(
         &self,
         channel_parameters: &ChannelTransactionParameters,
