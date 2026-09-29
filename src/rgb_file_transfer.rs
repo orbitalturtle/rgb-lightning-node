@@ -31,6 +31,7 @@ use lightning::ln::wire::{CustomMessageReader, Type};
 use lightning::rgb_utils::get_media_staging_dir;
 use lightning::types::features::{InitFeatures, NodeFeatures};
 use lightning::util::ser::{LengthLimitedRead, Readable, Writeable, Writer};
+use rgb_lib::{ConsignmentExt, ContractId, FileContent, RgbTransfer};
 
 // Custom Lightning message type id used for RGB file-transfer chunks.
 //
@@ -243,6 +244,13 @@ pub(crate) trait PeerChannelGate: Send + Sync {
 
     // Whether any of our channels is funded by `funding_txid`.
     fn has_channel_funded_by(&self, funding_txid: &str) -> bool;
+
+    // The RGB contracts of the colored channels we have with `peer`, including ones still being
+    // negotiated. A channel's contract is fixed at negotiation time (the `open_channel` `rgb_asset`
+    // field), so this is known before any funding consignment arrives. A funding consignment from
+    // `peer` is only legitimate if it is for one of these contracts; a peer opening only vanilla
+    // channels has none, so any consignment it sends is illegitimate.
+    fn contract_ids_with(&self, peer: &PublicKey) -> Vec<ContractId>;
 }
 
 // Identifies one funding's staged state.
@@ -316,6 +324,13 @@ pub(crate) struct RgbFileTransferHandler {
     // [`CHUNK_SIZE`]. Read through [`Self::chunk_size`], never directly.
     #[cfg(test)]
     chunk_size: usize,
+    // Test-only toggle for consignment content validation. Production always validates (see
+    // [`Self::validate_consignment_content`]); the transport-layer unit tests deliberately drive
+    // opaque byte blobs to exercise chunking/reassembly/caps independently of RGB content, so they
+    // default this off and the few tests that want validation opt in via
+    // [`Self::with_content_validation`].
+    #[cfg(test)]
+    validate_consignment_content: bool,
 }
 
 impl RgbFileTransferHandler {
@@ -339,6 +354,8 @@ impl RgbFileTransferHandler {
             max_consignment_size: MAX_CONSIGNMENT_SIZE,
             #[cfg(test)]
             chunk_size: CHUNK_SIZE,
+            #[cfg(test)]
+            validate_consignment_content: false,
         }
     }
 
@@ -362,6 +379,24 @@ impl RgbFileTransferHandler {
     #[cfg(test)]
     fn max_consignment_size(&self) -> usize {
         self.max_consignment_size
+    }
+
+    // Whether to validate a reassembled consignment's RGB content before persisting it. Always on in
+    // production; the transport-layer unit tests turn it off so they can use opaque payloads.
+    #[cfg(not(test))]
+    fn validate_consignment_content(&self) -> bool {
+        true
+    }
+
+    #[cfg(test)]
+    fn validate_consignment_content(&self) -> bool {
+        self.validate_consignment_content
+    }
+
+    #[cfg(test)]
+    fn with_content_validation(mut self, on: bool) -> Self {
+        self.validate_consignment_content = on;
+        self
     }
 
     #[cfg(test)]
@@ -625,6 +660,42 @@ impl RgbFileTransferHandler {
     fn persist_file(&self, key: &ReassemblyKey, bytes: Vec<u8>, now: Instant) {
         match key.file_kind {
             FILE_KIND_CONSIGNMENT => {
+                // Validate the consignment's RGB content against what the channel negotiation
+                // already committed to, before it ever touches disk. The contract a channel is for
+                // is fixed at negotiation time (the `open_channel` `rgb_asset` field), well before
+                // this consignment arrives, so two things can be rejected here that the acceptor
+                // would otherwise only discover much later -- or, for a vanilla channel, never:
+                //   * bytes that are not a valid RGB consignment at all (pure junk), and
+                //   * a valid consignment for a different contract than this channel was opened for.
+                // A vanilla channel has no negotiated contract, so `contract_ids_with` is empty and
+                // every consignment is refused: a vanilla channel never legitimately carries one.
+                // This is defense-in-depth: the authoritative validation (that the transfer assigns
+                // the right amount to the real funding outpoint) still runs later in `handle_funding`
+                // once the funding txid is known, which is the only place it can.
+                if self.validate_consignment_content() {
+                    let consignment = match RgbTransfer::load(&mut std::io::Cursor::new(&bytes)) {
+                        Ok(consignment) => consignment,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Refusing RGB consignment from peer {} for funding txid {}: not a valid consignment: {e}",
+                                key.peer,
+                                key.funding_txid,
+                            );
+                            return;
+                        }
+                    };
+                    let expected = self.channel_gate.contract_ids_with(&key.peer);
+                    if !expected.contains(&consignment.contract_id()) {
+                        tracing::warn!(
+                            "Refusing RGB consignment from peer {} for funding txid {}: contract {} matches no channel negotiated with this peer",
+                            key.peer,
+                            key.funding_txid,
+                            consignment.contract_id(),
+                        );
+                        return;
+                    }
+                }
+
                 // peer identities are free, so the count of held consignments is bounded node-wide
                 // rather than per peer: the funding txid is a string the sender could invent, so
                 // any peer could otherwise write unlimited files without ever funding anything, and
@@ -1094,6 +1165,13 @@ mod tests {
 
         fn has_channel_funded_by(&self, funding_txid: &str) -> bool {
             self.funded_txids.iter().any(|t| t == funding_txid)
+        }
+
+        fn contract_ids_with(&self, _peer: &PublicKey) -> Vec<ContractId> {
+            // The transport-layer tests default content validation off (see
+            // `validate_consignment_content`), so this is unused by them; production coverage of the
+            // validation path is the live `junk_consignment_vanilla_bypass_is_fixed` integration test.
+            Vec::new()
         }
     }
 
