@@ -28,9 +28,9 @@ use lightning::onion_message::messenger::{
     DefaultMessageRouter, OnionMessenger as LdkOnionMessenger,
 };
 use lightning::rgb_utils::{
-    get_rgb_channel_info_pending, is_channel_rgb, parse_rgb_payment_info, read_rgb_transfer_info,
-    update_rgb_channel_amount, write_rgb_channel_info, INDEXER_URL_FNAME, STATIC_BLINDING,
-    WALLET_MASTER_FINGERPRINT_FNAME,
+    get_rgb_channel_info_path, get_rgb_channel_info_pending, is_channel_rgb,
+    parse_rgb_payment_info, read_rgb_transfer_info, update_rgb_channel_amount,
+    write_rgb_channel_info, INDEXER_URL_FNAME, STATIC_BLINDING, WALLET_MASTER_FINGERPRINT_FNAME,
 };
 use lightning::routing::gossip;
 use lightning::routing::gossip::{NodeId, P2PGossipSync};
@@ -164,6 +164,16 @@ pub(crate) static HELD_PAYMENT_CLAIMABLE_COUNT: AtomicUsize = AtomicUsize::new(0
 // to model a channel counterparty whose wire client is not bound by the sender-side clamp.
 #[cfg(test)]
 pub(crate) static FORCE_PUSH_ASSET_AMOUNT_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
+// SECURITY REPRO (test-only, compiled out in production): the node with this pubkey sends a
+// garbage "consignment" over p2p for the funding txid of an otherwise ordinary *vanilla* (uncolored)
+// channel open. `rgb_file_transfer.rs`'s `handle_chunk` only checks that the sender has a channel
+// with us -- it has no idea, and no way to know, whether that channel actually negotiated as
+// colored -- so nothing stops a peer from doing this on its own, entirely independent of what its
+// own REST/RGB layer would ever construct. Models a malicious node, not a broken honest one.
+#[cfg(test)]
+pub(crate) static INJECT_FAKE_CONSIGNMENT_ON_VANILLA_OPEN_ON_NODE: Mutex<Option<PublicKey>> =
+    Mutex::new(None);
 
 // Test-only: whether the given override targets the node we are running as
 #[cfg(test)]
@@ -1006,6 +1016,22 @@ async fn handle_ldk_events(
                 unlocked_state.peer_manager.process_events();
             }
 
+            // SECURITY REPRO HOOK (test-only, compiled out in production): fires regardless of
+            // whether this open carried an asset at all -- the vanilla-channel bypass this models
+            // has nothing to do with the `asset_id` branch above, that's exactly the point.
+            #[cfg(test)]
+            if node_override_matches(
+                &INJECT_FAKE_CONSIGNMENT_ON_VANILLA_OPEN_ON_NODE,
+                unlocked_state.channel_manager.get_our_node_id(),
+            ) {
+                let _ = unlocked_state.rgb_file_transfer_handler.queue_consignment(
+                    counterparty_node_id,
+                    funding_txid_str.clone(),
+                    b"this is not an RGB consignment, it is attacker-controlled junk".to_vec(),
+                );
+                unlocked_state.peer_manager.process_events();
+            }
+
             let channel_manager_copy = unlocked_state.channel_manager.clone();
 
             // Give the funding transaction back to LDK for opening the channel.
@@ -1448,20 +1474,85 @@ async fn handle_ldk_events(
                 fs::remove_file(&pending_funding_path).unwrap();
             } else {
                 // acceptor
+                //
+                // Whether this channel actually carries an asset is decided once, by
+                // `handle_funding` -- called while processing the peer's `funding_created`,
+                // before our funding signature ever goes out and before anything broadcasts. It
+                // validates the peer's consignment and, only on success, records a pending
+                // `RgbInfo` for this channel (renamed from the temporary to the final channel ID
+                // by the time we get here). That record -- not whether a file merely exists at
+                // the conventional consignment path -- is the only thing that tells us whether
+                // this is genuinely a colored channel: `rgb_file_transfer.rs`'s chunk acceptor
+                // has no notion of "colored", so a peer can pair an ordinary vanilla channel open
+                // with a bogus file sent independently over the same p2p connection, and nothing
+                // upstream of this check would have caught it.
+                let is_chan_colored = get_rgb_channel_info_path(
+                    &channel_id.0.as_hex().to_string(),
+                    &static_state.ldk_data_dir,
+                    /* pending */ true,
+                )
+                .exists();
+                if !is_chan_colored {
+                    // vanilla channel: handle_funding never validated (or was never asked to
+                    // validate) a consignment for it, so there is nothing of ours to load here,
+                    // regardless of what a peer may have left on disk.
+                    return Ok(());
+                }
+
                 let consignment_path = static_state
                     .ldk_data_dir
                     .join(format!("consignment_{funding_txid}"));
-                if !consignment_path.exists() {
-                    // vanilla channel
-                    return Ok(());
-                }
-                let consignment =
-                    RgbTransfer::load_file(consignment_path).expect("successful consignment load");
+                let consignment = match RgbTransfer::load_file(consignment_path.clone()) {
+                    Ok(consignment) => consignment,
+                    Err(e) => {
+                        // handle_funding already validated a consignment for this channel once,
+                        // so getting here means something changed or broke between then and now
+                        // (disk corruption, a bug elsewhere) -- not a peer we haven't already
+                        // vetted. Continuing with an asset we cannot establish is unsafe, and
+                        // retrying (`ReplayEvent`) would just hit the same error forever: give up
+                        // on the channel instead of crashing the node or looping on it.
+                        tracing::error!(
+                            "Cannot load funding consignment for channel {channel_id}, closing it: {e}"
+                        );
+                        let _ = fs::remove_file(&consignment_path);
+                        if let Err(close_err) = unlocked_state
+                            .channel_manager
+                            .force_close_broadcasting_latest_txn(
+                                &channel_id,
+                                &counterparty_node_id,
+                                format!("cannot load funding consignment: {e}"),
+                            )
+                        {
+                            tracing::error!(
+                                "Failed to force-close channel {channel_id} after a consignment load failure: {close_err:?}"
+                            );
+                        }
+                        return Ok(());
+                    }
+                };
 
                 match unlocked_state.rgb_save_new_asset(consignment, funding_txid.clone()) {
                     Ok(_) => {}
                     Err(e) if e.to_string().contains("UNIQUE constraint failed") => {}
-                    Err(e) => panic!("Failed saving asset: {e}"),
+                    Err(e) => {
+                        tracing::error!(
+                            "Cannot save asset for channel {channel_id}, closing it: {e}"
+                        );
+                        let _ = fs::remove_file(&consignment_path);
+                        if let Err(close_err) = unlocked_state
+                            .channel_manager
+                            .force_close_broadcasting_latest_txn(
+                                &channel_id,
+                                &counterparty_node_id,
+                                format!("cannot save asset: {e}"),
+                            )
+                        {
+                            tracing::error!(
+                                "Failed to force-close channel {channel_id} after an asset save failure: {close_err:?}"
+                            );
+                        }
+                        return Ok(());
+                    }
                 }
 
                 // the consignment record can stop counting against the node-wide pending-consignment cap
