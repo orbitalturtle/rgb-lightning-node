@@ -188,8 +188,35 @@ async fn junk_consignment_vanilla_bypass_is_fixed() {
         !log.contains("panicked"),
         "victim panicked despite the fix; log:\n{log}",
     );
+
+    // the stronger claim, not just "it didn't crash": with ingestion-side validation, the junk is
+    // rejected before it is ever written, so no `consignment_<txid>` file should exist under the
+    // victim's LDK data dir at all. (The unfixed node writes one here and later panics loading it.)
+    let ldk_dir = format!("{victim_dir}/.ldk");
+    let stray_consignments: Vec<_> = std::fs::read_dir(&ldk_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("consignment_")
+                })
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        stray_consignments.is_empty(),
+        "junk consignment reached disk despite ingestion validation: {stray_consignments:?}",
+    );
+    assert!(
+        log.contains("Refusing RGB consignment"),
+        "expected the victim to log an ingestion-time refusal of the junk consignment; log:\n{log}",
+    );
     println!(
-        "confirmed: the vanilla channel open + injected fake consignment no longer crashes the victim"
+        "confirmed: the junk consignment was refused at ingestion and never written; the vanilla \
+         channel open no longer crashes the victim"
     );
 
     // restart, for good measure: the unfixed node also crash-loops on every subsequent startup

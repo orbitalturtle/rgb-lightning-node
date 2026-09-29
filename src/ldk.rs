@@ -577,6 +577,15 @@ impl PeerChannelGate for ChannelManager {
                 .is_some_and(|txo| txo.txid.to_string() == funding_txid)
         })
     }
+
+    fn contract_ids_with(&self, peer: &PublicKey) -> Vec<ContractId> {
+        // includes channels still being negotiated, so the contract is available from the moment
+        // the channel is created -- before its funding consignment arrives
+        self.list_channels_with_counterparty(peer)
+            .iter()
+            .filter_map(|chan| chan.contract_id)
+            .collect()
+    }
 }
 
 pub(crate) type NetworkGraph = gossip::NetworkGraph<Arc<FilesystemLogger>>;
