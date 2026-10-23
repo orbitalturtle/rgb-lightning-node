@@ -95,7 +95,7 @@ use crate::{
 use crate::{
     disk::{self, CHANNEL_PEER_DATA},
     error::APIError,
-    ldk::{PaymentInfo, UTXO_SIZE_SAT},
+    ldk::{clear_rgb_payment_pending, PaymentInfo, UTXO_SIZE_SAT},
     utils::{
         connect_peer_if_necessary, get_current_timestamp, no_cancel, parse_peer_info, AppState,
     },
@@ -2531,6 +2531,7 @@ pub(crate) async fn keysend(
             }
             Err(e) => {
                 tracing::error!("ERROR: failed to send payment: {:?}", e);
+                clear_rgb_payment_pending(&payment_hash, &state.static_state.ldk_data_dir);
                 unlocked_state.update_outbound_payment_status(payment_id, HTLCStatus::Failed);
                 HTLCStatus::Failed
             }
@@ -3274,6 +3275,10 @@ pub(crate) async fn maker_execute(
             }
             Err(e) => {
                 tracing::warn!("ERROR: failed to send payment: {:?}", e);
+                clear_rgb_payment_pending(
+                    &swapstring.payment_hash,
+                    &state.static_state.ldk_data_dir,
+                );
                 (HTLCStatus::Failed, Some(e))
             }
         };
@@ -4193,6 +4198,10 @@ pub(crate) async fn send_payment(
                 },
                 Err(e) => {
                     tracing::error!("ERROR: failed to send payment: {:?}", e);
+                    clear_rgb_payment_pending(
+                        &payment_hash,
+                        &state.static_state.ldk_data_dir,
+                    );
                     status = HTLCStatus::Failed;
                     unlocked_state.update_outbound_payment_status(payment_id, status);
                 },

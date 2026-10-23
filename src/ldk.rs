@@ -28,9 +28,9 @@ use lightning::onion_message::messenger::{
     DefaultMessageRouter, OnionMessenger as LdkOnionMessenger,
 };
 use lightning::rgb_utils::{
-    get_rgb_channel_info_pending, is_channel_rgb, parse_rgb_payment_info, read_rgb_transfer_info,
-    update_rgb_channel_amount, write_rgb_channel_info, INDEXER_URL_FNAME, STATIC_BLINDING,
-    WALLET_MASTER_FINGERPRINT_FNAME,
+    get_rgb_channel_info_pending, get_rgb_payment_info_path, is_channel_rgb,
+    parse_rgb_payment_info, read_rgb_transfer_info, update_rgb_channel_amount,
+    write_rgb_channel_info, INDEXER_URL_FNAME, STATIC_BLINDING, WALLET_MASTER_FINGERPRINT_FNAME,
 };
 use lightning::routing::gossip;
 use lightning::routing::gossip::{NodeId, P2PGossipSync};
@@ -634,6 +634,24 @@ fn find_and_update_rgb_chan_amt(ldk_data_dir: &Path, payment_hash: &PaymentHash,
             };
             update_rgb_channel_amount(&channel_id_str, offered, received, ldk_data_dir, false);
             break;
+        }
+    }
+}
+
+pub(crate) fn clear_rgb_payment_pending(payment_hash: &PaymentHash, ldk_data_dir: &Path) {
+    let payment_path = get_rgb_payment_info_path(payment_hash, ldk_data_dir, false);
+    let extension = payment_path
+        .extension()
+        .expect("RGB payment info path has an extension")
+        .to_string_lossy();
+
+    let pending_payment_path = payment_path.with_extension(format!("{extension}_pending"));
+    if let Err(err) = fs::remove_file(&pending_payment_path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                "Unable to remove RGB pending payment artifact {}: {err}",
+                pending_payment_path.display()
+            );
         }
     }
 }
@@ -1243,6 +1261,7 @@ async fn handle_ldk_events(
             ..
         } => {
             if let Some(hash) = payment_hash {
+                clear_rgb_payment_pending(&hash, &static_state.ldk_data_dir);
                 tracing::error!(
                     "EVENT: Failed to send payment to payment ID {}, payment hash {}: {:?}",
                     payment_id,
@@ -1289,6 +1308,7 @@ async fn handle_ldk_events(
             inbound_amount_forwarded_rgb,
             payment_hash,
         } => {
+            clear_rgb_payment_pending(&payment_hash, &static_state.ldk_data_dir);
             let prev_channel_id_str = prev_channel_id.expect("prev_channel_id").to_string();
             let next_channel_id_str = next_channel_id.expect("next_channel_id").to_string();
 
