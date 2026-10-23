@@ -197,6 +197,8 @@ pub(crate) struct PaymentInfo {
     pub(crate) expires_at: Option<u64>,
     pub(crate) description: Option<String>,
     pub(crate) description_hash: Option<[u8; 32]>,
+    pub(crate) asset_id: Option<String>,
+    pub(crate) asset_amount: Option<u64>,
 }
 
 impl_writeable_tlv_based!(PaymentInfo, {
@@ -210,6 +212,8 @@ impl_writeable_tlv_based!(PaymentInfo, {
     (14, expires_at, option),
     (16, description, option),
     (18, description_hash, option),
+    (24, asset_id, option),
+    (26, asset_amount, option),
 });
 
 pub(crate) struct InboundPaymentInfoStorage {
@@ -337,6 +341,24 @@ impl UnlockedAppState {
         Ok(())
     }
 
+    pub(crate) fn fail_htlc_backwards_and_update_inbound_payment(
+        &self,
+        payment_hash: PaymentHash,
+        status: HTLCStatus,
+        preimage: Option<PaymentPreimage>,
+        secret: Option<PaymentSecret>,
+    ) {
+        self.channel_manager.fail_htlc_backwards(&payment_hash);
+        self.upsert_inbound_payment(
+            payment_hash,
+            status,
+            preimage,
+            secret,
+            None,
+            self.channel_manager.get_our_node_id(),
+        );
+    }
+
     fn fail_outbound_pending_payments(&self, recent_payments_payment_ids: Vec<PaymentId>) {
         let mut outbound = self.get_outbound_payments();
         let mut failed = false;
@@ -434,6 +456,8 @@ impl UnlockedAppState {
                     expires_at: None,
                     description: None,
                     description_hash: None,
+                    asset_id: None,
+                    asset_amount: None,
                 });
             }
         }
@@ -1087,18 +1111,79 @@ async fn handle_ldk_events(
                     tracing::info!("TEST: resuming PaymentClaimable for {}", payment_hash);
                 }
             }
-            let payment_preimage = match purpose {
+            let (payment_preimage, payment_secret, invoice) = match purpose {
+                PaymentPurpose::SpontaneousPayment(preimage) => {
+                    unlocked_state.channel_manager.claim_funds(preimage);
+                    return Ok(());
+                }
                 PaymentPurpose::Bolt11InvoicePayment {
-                    payment_preimage, ..
-                } => payment_preimage,
-                PaymentPurpose::Bolt12OfferPayment {
-                    payment_preimage, ..
-                } => payment_preimage,
-                PaymentPurpose::Bolt12RefundPayment {
-                    payment_preimage, ..
-                } => payment_preimage,
-                PaymentPurpose::SpontaneousPayment(preimage) => Some(preimage),
+                    payment_preimage,
+                    payment_secret,
+                    ..
+                }
+                | PaymentPurpose::Bolt12OfferPayment {
+                    payment_preimage,
+                    payment_secret,
+                    ..
+                }
+                | PaymentPurpose::Bolt12RefundPayment {
+                    payment_preimage,
+                    payment_secret,
+                    ..
+                } => {
+                    let invoice = unlocked_state
+                        .get_inbound_payments()
+                        .payments
+                        .get(&payment_hash)
+                        .cloned()
+                        .expect("Missing inbound payment state for claimable payment");
+
+                    (payment_preimage, Some(payment_secret), invoice)
+                }
             };
+
+            if let (Some(expected_asset_id), Some(expected_asset_amount)) =
+                (invoice.asset_id.as_deref(), invoice.asset_amount)
+            {
+                let inbound_rgb_payment_path = get_rgb_payment_info_path(
+                    &payment_hash,
+                    &PathBuf::from(&static_state.ldk_data_dir),
+                    true,
+                );
+                let rgb_payment = inbound_rgb_payment_path
+                    .exists()
+                    .then(|| parse_rgb_payment_info(&inbound_rgb_payment_path));
+                let asset_id_matches = rgb_payment
+                    .as_ref()
+                    .is_some_and(|payment| payment.contract_id.to_string() == expected_asset_id);
+                let asset_amount_is_sufficient = rgb_payment
+                    .as_ref()
+                    .is_some_and(|payment| payment.amount >= expected_asset_amount);
+
+                if !asset_id_matches || !asset_amount_is_sufficient {
+                    let invalid_fields = match (asset_id_matches, asset_amount_is_sufficient) {
+                        (false, false) => "asset ID and asset amount",
+                        (false, true) => "asset ID",
+                        (true, false) => "asset amount",
+                        (true, true) => unreachable!(),
+                    };
+                    let received_asset_id = rgb_payment
+                        .as_ref()
+                        .map(|payment| payment.contract_id.to_string());
+                    let received_asset_amount = rgb_payment.as_ref().map(|payment| payment.amount);
+                    tracing::warn!(
+                        "Received invalid {invalid_fields} for invoice with payment hash {payment_hash}: expected asset ID {expected_asset_id} and asset amount at least {expected_asset_amount}; received asset ID {received_asset_id:?} and asset amount {received_asset_amount:?}",
+                    );
+                    unlocked_state.fail_htlc_backwards_and_update_inbound_payment(
+                        payment_hash,
+                        HTLCStatus::Failed,
+                        payment_preimage,
+                        payment_secret,
+                    );
+                    return Ok(());
+                }
+            }
+
             unlocked_state
                 .channel_manager
                 .claim_funds(payment_preimage.unwrap());
