@@ -1,4 +1,5 @@
 use amplify::s;
+use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::io;
 use bitcoin::secp256k1::PublicKey;
@@ -12,7 +13,7 @@ use lightning::routing::router::{
 use lightning::{
     onion_message::packet::OnionMessageContents,
     sign::KeysManager,
-    types::payment::PaymentHash,
+    types::payment::{PaymentHash, PaymentPreimage},
     util::ser::{Writeable, Writer},
 };
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
@@ -488,4 +489,20 @@ pub(crate) fn validate_and_parse_payment_hash(
         return Err(APIError::InvalidPaymentHash(payment_hash_str.to_string()));
     }
     Ok(PaymentHash(payment_hash_vec.unwrap().try_into().unwrap()))
+}
+
+pub(crate) fn validate_and_parse_payment_preimage(
+    payment_preimage_str: &str,
+    payment_hash: &PaymentHash,
+) -> Result<PaymentPreimage, APIError> {
+    let preimage_vec = hex_str_to_vec(payment_preimage_str);
+    if preimage_vec.is_none() || preimage_vec.as_ref().unwrap().len() != 32 {
+        return Err(APIError::InvalidPaymentPreimage);
+    }
+    let preimage = PaymentPreimage(preimage_vec.unwrap().try_into().unwrap());
+    let computed_hash = PaymentHash(Sha256::hash(&preimage.0).to_byte_array());
+    if computed_hash != *payment_hash {
+        return Err(APIError::InvalidPaymentPreimage);
+    }
+    Ok(preimage)
 }

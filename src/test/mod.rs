@@ -1241,6 +1241,7 @@ async fn ln_invoice(
         asset_amount,
         description: None,
         description_hash: None,
+        payment_hash: None,
         min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()

@@ -86,7 +86,8 @@ use crate::utils::{
     check_already_initialized, check_channel_id, check_password_strength, check_password_validity,
     description_fields, encrypt_and_save_mnemonic, get_max_local_rgb_amount, get_mnemonic_path,
     get_route, hex_str, hex_str_to_compressed_pubkey, hex_str_to_vec,
-    validate_and_parse_payment_hash, UnlockedAppState, UserOnionMessageContents,
+    validate_and_parse_payment_hash, validate_and_parse_payment_preimage, UnlockedAppState,
+    UserOnionMessageContents,
 };
 use crate::{
     backup::{do_backup, restore_backup},
@@ -95,7 +96,7 @@ use crate::{
 use crate::{
     disk::{self, CHANNEL_PEER_DATA},
     error::APIError,
-    ldk::{clear_rgb_payment_pending, PaymentInfo, UTXO_SIZE_SAT},
+    ldk::{clear_rgb_payment_pending, InvoiceType, PaymentInfo, UTXO_SIZE_SAT},
     utils::{
         connect_peer_if_necessary, get_current_timestamp, no_cancel, parse_peer_info, AppState,
     },
@@ -441,6 +442,11 @@ pub(crate) struct BtcBalanceResponse {
     pub(crate) colored: BtcBalance,
 }
 
+#[derive(Deserialize, Serialize)]
+pub(crate) struct CancelHodlInvoiceRequest {
+    pub(crate) payment_hash: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct ChangePasswordRequest {
     pub(crate) old_password: String,
@@ -490,6 +496,12 @@ pub(crate) struct CheckIndexerUrlResponse {
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct CheckProxyEndpointRequest {
     pub(crate) proxy_endpoint: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ClaimHodlInvoiceRequest {
+    pub(crate) payment_hash: String,
+    pub(crate) payment_preimage: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -668,7 +680,10 @@ pub(crate) struct GetSwapResponse {
 #[display(inner)]
 pub(crate) enum HTLCStatus {
     Pending,
+    Claimable,
+    Claiming,
     Succeeded,
+    Cancelled,
     Failed,
 }
 
@@ -676,6 +691,9 @@ impl_writeable_tlv_based_enum!(HTLCStatus,
     (0, Pending) => {},
     (1, Succeeded) => {},
     (2, Failed) => {},
+    (3, Claimable) => {},
+    (4, Claiming) => {},
+    (5, Cancelled) => {},
 );
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -720,7 +738,10 @@ pub(crate) struct InitResponse {
 #[derive(Clone, Copy, Deserialize, Serialize)]
 pub(crate) enum InvoiceStatus {
     Pending,
+    Claimable,
+    Claiming,
     Succeeded,
+    Cancelled,
     Failed,
     Expired,
 }
@@ -895,6 +916,7 @@ pub(crate) struct LNInvoiceRequest {
     pub(crate) asset_amount: Option<u64>,
     pub(crate) description: Option<String>,
     pub(crate) description_hash: Option<String>,
+    pub(crate) payment_hash: Option<String>,
     pub(crate) min_final_cltv_expiry_delta: Option<u16>,
 }
 
@@ -1734,6 +1756,43 @@ pub(crate) async fn btc_balance(
     Ok(Json(BtcBalanceResponse { vanilla, colored }))
 }
 
+pub(crate) async fn cancel_hodl_invoice(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<CancelHodlInvoiceRequest>, APIError>,
+) -> Result<Json<EmptyResponse>, APIError> {
+    no_cancel(async move {
+        let guard = state.check_unlocked().await?;
+        let unlocked_state = guard.as_ref().unwrap();
+
+        let payment_hash = validate_and_parse_payment_hash(&payload.payment_hash)?;
+        let payment_info = unlocked_state
+            .get_inbound_payments()
+            .payments
+            .get(&payment_hash)
+            .cloned()
+            .ok_or(APIError::UnknownLNInvoice)?;
+        if !matches!(payment_info.invoice_type, Some(InvoiceType::Hodl)) {
+            return Err(APIError::InvoiceNotHodl);
+        }
+        match payment_info.status {
+            HTLCStatus::Claimable => {}
+            HTLCStatus::Succeeded => return Err(APIError::InvoiceAlreadyClaimed),
+            HTLCStatus::Claiming => return Err(APIError::InvoiceSettlingInProgress),
+            _ => return Err(APIError::InvoiceNotCancellable),
+        }
+
+        unlocked_state.fail_htlc_backwards_and_update_inbound_payment(
+            payment_hash,
+            HTLCStatus::Cancelled,
+            None,
+            None,
+        );
+
+        Ok(Json(EmptyResponse {}))
+    })
+    .await
+}
+
 pub(crate) async fn change_password(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<ChangePasswordRequest>, APIError>,
@@ -1773,6 +1832,57 @@ pub(crate) async fn check_proxy_endpoint(
     check_rgb_proxy_endpoint(&payload.proxy_endpoint).await?;
 
     Ok(Json(EmptyResponse {}))
+}
+
+pub(crate) async fn claim_hodl_invoice(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<ClaimHodlInvoiceRequest>, APIError>,
+) -> Result<Json<EmptyResponse>, APIError> {
+    no_cancel(async move {
+        let (channel_manager, preimage) = {
+            let guard = state.check_unlocked().await?;
+            let unlocked_state = guard.as_ref().unwrap();
+
+            let payment_hash = validate_and_parse_payment_hash(&payload.payment_hash)?;
+            let preimage =
+                validate_and_parse_payment_preimage(&payload.payment_preimage, &payment_hash)?;
+
+            let mut inbound = unlocked_state.get_inbound_payments();
+            let Some(existing_payment_mut) = inbound.payments.get_mut(&payment_hash) else {
+                return Err(APIError::UnknownLNInvoice);
+            };
+
+            if !matches!(existing_payment_mut.invoice_type, Some(InvoiceType::Hodl)) {
+                return Err(APIError::InvoiceNotHodl);
+            }
+
+            match existing_payment_mut.status {
+                HTLCStatus::Succeeded => return Err(APIError::InvoiceAlreadyClaimed),
+                HTLCStatus::Claiming => return Err(APIError::InvoiceSettlingInProgress),
+                HTLCStatus::Claimable => {}
+                _ => return Err(APIError::InvoiceNotClaimable),
+            }
+
+            let current_height = unlocked_state.channel_manager.current_best_block().height;
+            if let Some(deadline_height) = existing_payment_mut.claim_deadline_height {
+                if current_height >= deadline_height {
+                    return Err(APIError::ClaimDeadlineExceeded);
+                }
+            }
+
+            existing_payment_mut.status = HTLCStatus::Claiming;
+            existing_payment_mut.preimage = Some(preimage);
+            existing_payment_mut.updated_at = get_current_timestamp();
+            unlocked_state.save_inbound_payments(inbound);
+
+            (unlocked_state.channel_manager.clone(), preimage)
+        };
+
+        channel_manager.claim_funds(preimage);
+
+        Ok(Json(EmptyResponse {}))
+    })
+    .await
 }
 
 pub(crate) async fn close_channel(
@@ -2323,7 +2433,10 @@ pub(crate) async fn invoice_status(
         Some(v) => match v.status {
             HTLCStatus::Pending if invoice.is_expired() => InvoiceStatus::Expired,
             HTLCStatus::Pending => InvoiceStatus::Pending,
+            HTLCStatus::Claimable => InvoiceStatus::Claimable,
+            HTLCStatus::Claiming => InvoiceStatus::Claiming,
             HTLCStatus::Succeeded => InvoiceStatus::Succeeded,
+            HTLCStatus::Cancelled => InvoiceStatus::Cancelled,
             HTLCStatus::Failed => InvoiceStatus::Failed,
         },
         None => return Err(APIError::UnknownLNInvoice),
@@ -2504,6 +2617,8 @@ pub(crate) async fn keysend(
                 expires_at: None,
                 description: None,
                 description_hash: None,
+                claim_deadline_height: None,
+                invoice_type: None,
                 asset_id: None,
                 asset_amount: None,
             },
@@ -3011,14 +3126,28 @@ pub(crate) async fn ln_invoice(
                 (None, None) => Bolt11InvoiceDescription::Direct(Description::empty()),
             };
 
+        let (requested_payment_hash, invoice_type) = match &payload.payment_hash {
+            Some(payment_hash) => {
+                let payment_hash = validate_and_parse_payment_hash(payment_hash)?;
+                if unlocked_state
+                    .inbound_payments()
+                    .contains_key(&payment_hash)
+                {
+                    return Err(APIError::PaymentHashAlreadyUsed);
+                }
+                (Some(payment_hash), InvoiceType::Hodl)
+            }
+            None => (None, InvoiceType::AutoClaim),
+        };
+
         let invoice_params = Bolt11InvoiceParameters {
             amount_msats: payload.amt_msat,
             description,
             invoice_expiry_delta_secs: Some(payload.expiry_sec),
             min_final_cltv_expiry_delta: payload.min_final_cltv_expiry_delta,
+            payment_hash: requested_payment_hash,
             contract_id,
             asset_amount: payload.asset_amount,
-            ..Default::default()
         };
 
         let invoice = unlocked_state
@@ -3042,6 +3171,8 @@ pub(crate) async fn ln_invoice(
                 expires_at: Some(created_at + payload.expiry_sec as u64),
                 description,
                 description_hash,
+                claim_deadline_height: None,
+                invoice_type: Some(invoice_type),
                 asset_id: contract_id.map(|id| id.to_string()),
                 asset_amount: payload.asset_amount,
             },
@@ -4080,6 +4211,8 @@ pub(crate) async fn send_payment(
                     expires_at: None,
                     description: None,
                     description_hash: None,
+                    claim_deadline_height: None,
+                    invoice_type: None,
                     asset_id: None,
                     asset_amount: None,
                 },
@@ -4177,6 +4310,8 @@ pub(crate) async fn send_payment(
                     expires_at: None,
                     description,
                     description_hash,
+                    claim_deadline_height: None,
+                    invoice_type: None,
                     asset_id: None,
                     asset_amount: None,
                 },

@@ -23,6 +23,7 @@ async fn invoice() {
         asset_amount: Some(1),
         description: None,
         description_hash: None,
+        payment_hash: None,
         min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
@@ -41,6 +42,7 @@ async fn invoice() {
         asset_amount: Some(1),
         description: None,
         description_hash: None,
+        payment_hash: None,
         min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
@@ -59,6 +61,7 @@ async fn invoice() {
         asset_amount: None,
         description: None,
         description_hash: None,
+        payment_hash: None,
         min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
@@ -84,6 +87,7 @@ async fn invoice() {
         asset_amount: None,
         description: Some(description.to_string()),
         description_hash: None,
+        payment_hash: None,
         min_final_cltv_expiry_delta: Some(requested_min_final_cltv_expiry_delta),
     };
     let res = reqwest::Client::new()
@@ -124,6 +128,7 @@ async fn invoice() {
         asset_amount: None,
         description: None,
         description_hash: Some(description_hash.0.to_string()),
+        payment_hash: None,
         min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
@@ -165,6 +170,7 @@ async fn invoice() {
         asset_amount: None,
         description: Some(description.to_string()),
         description_hash: Some(description_hash.0.to_string()),
+        payment_hash: None,
         min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
@@ -189,6 +195,7 @@ async fn invoice() {
         asset_amount: None,
         description: None,
         description_hash: Some(s!("not-a-valid-description-hash")),
+        payment_hash: None,
         min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
@@ -213,6 +220,7 @@ async fn invoice() {
         asset_amount: None,
         description: Some("a".repeat(640)),
         description_hash: None,
+        payment_hash: None,
         min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
@@ -268,6 +276,7 @@ async fn zero_amount_invoice() {
         asset_amount: None,
         description: None,
         description_hash: None,
+        payment_hash: None,
         min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
@@ -351,6 +360,7 @@ async fn zero_amount_invoice() {
         asset_amount: None,
         description: None,
         description_hash: None,
+        payment_hash: None,
         min_final_cltv_expiry_delta: None,
     };
     let invoice_without_amount = reqwest::Client::new()
@@ -376,6 +386,7 @@ async fn zero_amount_invoice() {
         asset_amount: Some(50),
         description: None,
         description_hash: None,
+        payment_hash: None,
         min_final_cltv_expiry_delta: None,
     };
     let invoice_with_amount = reqwest::Client::new()
