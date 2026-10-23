@@ -12,6 +12,7 @@ use lightning::routing::router::{
 use lightning::{
     onion_message::packet::OnionMessageContents,
     sign::KeysManager,
+    types::payment::PaymentHash,
     util::ser::{Writeable, Writer},
 };
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
@@ -477,4 +478,14 @@ pub(crate) fn get_route(
     );
 
     route.ok()
+}
+
+pub(crate) fn validate_and_parse_payment_hash(
+    payment_hash_str: &str,
+) -> Result<PaymentHash, APIError> {
+    let payment_hash_vec = hex_str_to_vec(payment_hash_str);
+    if payment_hash_vec.is_none() || payment_hash_vec.as_ref().unwrap().len() != 32 {
+        return Err(APIError::InvalidPaymentHash(payment_hash_str.to_string()));
+    }
+    Ok(PaymentHash(payment_hash_vec.unwrap().try_into().unwrap()))
 }

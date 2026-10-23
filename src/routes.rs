@@ -85,8 +85,8 @@ use crate::swap::{SwapData, SwapInfo, SwapString};
 use crate::utils::{
     check_already_initialized, check_channel_id, check_password_strength, check_password_validity,
     description_fields, encrypt_and_save_mnemonic, get_max_local_rgb_amount, get_mnemonic_path,
-    get_route, hex_str, hex_str_to_compressed_pubkey, hex_str_to_vec, UnlockedAppState,
-    UserOnionMessageContents,
+    get_route, hex_str, hex_str_to_compressed_pubkey, hex_str_to_vec,
+    validate_and_parse_payment_hash, UnlockedAppState, UserOnionMessageContents,
 };
 use crate::{
     backup::{do_backup, restore_backup},
@@ -2120,11 +2120,7 @@ pub(crate) async fn get_payment(
     let guard = state.check_unlocked().await?;
     let unlocked_state = guard.as_ref().unwrap();
 
-    let payment_hash_vec = hex_str_to_vec(&payload.payment_hash);
-    if payment_hash_vec.is_none() || payment_hash_vec.as_ref().unwrap().len() != 32 {
-        return Err(APIError::InvalidPaymentHash(payload.payment_hash));
-    }
-    let requested_ph = PaymentHash(payment_hash_vec.unwrap().try_into().unwrap());
+    let requested_ph = validate_and_parse_payment_hash(&payload.payment_hash)?;
 
     let inbound_payments = unlocked_state.list_updated_inbound_payments();
     let outbound_payments = unlocked_state.outbound_payments();
@@ -2202,11 +2198,7 @@ pub(crate) async fn get_swap(
     let guard = state.check_unlocked().await?;
     let unlocked_state = guard.as_ref().unwrap();
 
-    let payment_hash_vec = hex_str_to_vec(&payload.payment_hash);
-    if payment_hash_vec.is_none() || payment_hash_vec.as_ref().unwrap().len() != 32 {
-        return Err(APIError::InvalidPaymentHash(payload.payment_hash));
-    }
-    let requested_ph = PaymentHash(payment_hash_vec.unwrap().try_into().unwrap());
+    let requested_ph = validate_and_parse_payment_hash(&payload.payment_hash)?;
 
     let map_swap = |payment_hash: &PaymentHash, swap_data: &SwapData, taker: bool| {
         let mut status = swap_data.status.clone();
