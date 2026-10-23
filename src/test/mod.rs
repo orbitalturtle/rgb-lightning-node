@@ -67,12 +67,12 @@ use crate::routes::{
     ListSwapsResponse, ListTransactionsRequest, ListTransactionsResponse, ListTransfersRequest,
     ListTransfersResponse, ListUnspentsRequest, ListUnspentsResponse, MakerExecuteRequest,
     MakerInitRequest, MakerInitResponse, NetworkInfoResponse, NodeInfoResponse, OpenChannelRequest,
-    OpenChannelResponse, Payment, Peer, PostAssetMediaResponse, ProvideOutOfBandAckRequest,
-    ProvideOutOfBandAckResponse, ProvideOutOfBandConsignmentResponse, Recipient, RefreshRequest,
-    RefreshResponse, RestoreRequest, RevokeTokenRequest, RgbInvoiceRequest, RgbInvoiceResponse,
-    SendBtcRequest, SendBtcResponse, SendPaymentRequest, SendPaymentResponse, SendRgbRequest,
-    SendRgbResponse, Swap, SwapStatus, TakerRequest, Transaction, Transfer, TransferStatus,
-    UnlockRequest, Unspent, WitnessData,
+    OpenChannelResponse, Payment, PaymentType, Peer, PostAssetMediaResponse,
+    ProvideOutOfBandAckRequest, ProvideOutOfBandAckResponse, ProvideOutOfBandConsignmentResponse,
+    Recipient, RefreshRequest, RefreshResponse, RestoreRequest, RevokeTokenRequest,
+    RgbInvoiceRequest, RgbInvoiceResponse, SendBtcRequest, SendBtcResponse, SendPaymentRequest,
+    SendPaymentResponse, SendRgbRequest, SendRgbResponse, Swap, SwapStatus, TakerRequest,
+    Transaction, Transfer, TransferStatus, UnlockRequest, Unspent, WitnessData,
 };
 use crate::utils::{hex_str, hex_str_to_vec, ELECTRUM_URL_REGTEST, LDK_DIR, PROXY_ENDPOINT_LOCAL};
 
@@ -1103,10 +1103,16 @@ async fn list_payments(node_address: SocketAddr) -> Vec<Payment> {
         .unwrap()
         .payments
 }
-async fn get_payment(node_address: SocketAddr, payment_hash: &str) -> Payment {
-    println!("getting payment for node {node_address}");
+
+async fn get_payment(
+    node_address: SocketAddr,
+    payment_hash: &str,
+    payment_type: PaymentType,
+) -> Payment {
+    println!("getting {payment_type:?} payment for node {node_address}");
     let payload = GetPaymentRequest {
         payment_hash: payment_hash.to_string(),
+        payment_type,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node_address}/getpayment"))

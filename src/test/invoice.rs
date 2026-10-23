@@ -324,7 +324,8 @@ async fn zero_amount_invoice() {
     wait_for_ln_payment(node2_addr, &decoded.payment_hash, HTLCStatus::Succeeded).await;
 
     // Verify that both sender and receiver payments record the actual amount
-    let payment_sender = get_payment(node1_addr, &decoded.payment_hash).await;
+    let payment_sender =
+        get_payment(node1_addr, &decoded.payment_hash, PaymentType::Outbound).await;
     assert_eq!(
         payment_sender.amt_msat,
         Some(payment_amount),
@@ -332,7 +333,12 @@ async fn zero_amount_invoice() {
     );
     assert_eq!(payment_sender.status, HTLCStatus::Succeeded);
 
-    let payment_receiver = get_payment(node2_addr, &decoded.payment_hash).await;
+    let payment_receiver = get_payment(
+        node2_addr,
+        &decoded.payment_hash,
+        PaymentType::InboundAutoClaim,
+    )
+    .await;
     assert_eq!(
         payment_receiver.amt_msat,
         Some(payment_amount),
@@ -425,7 +431,12 @@ async fn zero_amount_invoice() {
         HTLCStatus::Succeeded,
     )
     .await;
-    let payment = get_payment(node2_addr, &decoded_with_amount.payment_hash).await;
+    let payment = get_payment(
+        node2_addr,
+        &decoded_with_amount.payment_hash,
+        PaymentType::InboundAutoClaim,
+    )
+    .await;
     assert_eq!(payment.asset_id, Some(asset_id.clone()));
     assert_eq!(payment.asset_amount, Some(50));
 
@@ -518,6 +529,11 @@ async fn zero_amount_invoice() {
         HTLCStatus::Succeeded,
     )
     .await;
-    let payment = get_payment(node2_addr, &decoded_without_amount.payment_hash).await;
+    let payment = get_payment(
+        node2_addr,
+        &decoded_without_amount.payment_hash,
+        PaymentType::InboundAutoClaim,
+    )
+    .await;
     assert_eq!(payment.asset_amount, Some(100));
 }

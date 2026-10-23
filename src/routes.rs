@@ -658,6 +658,7 @@ pub(crate) struct GetConsignmentResponse {
 #[derive(Deserialize, Serialize)]
 pub(crate) struct GetPaymentRequest {
     pub(crate) payment_hash: String,
+    pub(crate) payment_type: PaymentType,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1040,7 +1041,7 @@ pub(crate) struct Payment {
     pub(crate) asset_amount: Option<u64>,
     pub(crate) asset_id: Option<String>,
     pub(crate) payment_hash: String,
-    pub(crate) inbound: bool,
+    pub(crate) payment_type: PaymentType,
     pub(crate) status: HTLCStatus,
     pub(crate) created_at: u64,
     pub(crate) updated_at: u64,
@@ -1048,6 +1049,20 @@ pub(crate) struct Payment {
     pub(crate) preimage: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) description_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) enum PaymentType {
+    Outbound,
+    InboundAutoClaim,
+    InboundHodl,
+}
+
+fn payment_type_from_invoice(invoice_type: Option<&InvoiceType>) -> PaymentType {
+    match invoice_type {
+        Some(InvoiceType::Hodl) => PaymentType::InboundHodl,
+        None | Some(InvoiceType::AutoClaim) => PaymentType::InboundAutoClaim,
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -2235,69 +2250,82 @@ pub(crate) async fn get_payment(
 
     let requested_ph = validate_and_parse_payment_hash(&payload.payment_hash)?;
 
-    let inbound_payments = unlocked_state.list_updated_inbound_payments();
-    let outbound_payments = unlocked_state.outbound_payments();
+    match payload.payment_type {
+        PaymentType::InboundAutoClaim | PaymentType::InboundHodl => {
+            let inbound_payments = unlocked_state.list_updated_inbound_payments();
 
-    for (payment_hash, payment_info) in &inbound_payments {
-        if payment_hash == &requested_ph {
-            let rgb_payment_info_path_inbound =
-                get_rgb_payment_info_path(payment_hash, &state.static_state.ldk_data_dir, true);
+            for (payment_hash, payment_info) in &inbound_payments {
+                let payment_type = payment_type_from_invoice(payment_info.invoice_type.as_ref());
+                if payment_hash == &requested_ph && payment_type == payload.payment_type {
+                    let rgb_payment_info_path_inbound = get_rgb_payment_info_path(
+                        payment_hash,
+                        &state.static_state.ldk_data_dir,
+                        true,
+                    );
 
-            let (asset_amount, asset_id) = if rgb_payment_info_path_inbound.exists() {
-                let info = parse_rgb_payment_info(&rgb_payment_info_path_inbound);
-                (Some(info.amount), Some(info.contract_id.to_string()))
-            } else {
-                (None, None)
-            };
+                    let (asset_amount, asset_id) = if rgb_payment_info_path_inbound.exists() {
+                        let info = parse_rgb_payment_info(&rgb_payment_info_path_inbound);
+                        (Some(info.amount), Some(info.contract_id.to_string()))
+                    } else {
+                        (None, None)
+                    };
 
-            return Ok(Json(GetPaymentResponse {
-                payment: Payment {
-                    amt_msat: payment_info.amt_msat,
-                    asset_amount,
-                    asset_id,
-                    payment_hash: hex_str(&payment_hash.0),
-                    inbound: true,
-                    status: payment_info.status,
-                    created_at: payment_info.created_at,
-                    updated_at: payment_info.updated_at,
-                    payee_pubkey: payment_info.payee_pubkey.to_string(),
-                    preimage: payment_info.preimage.map(|p| hex_str(&p.0)),
-                    description: payment_info.description.clone(),
-                    description_hash: payment_info.description_hash.map(|h| hex_str(&h)),
-                },
-            }));
+                    return Ok(Json(GetPaymentResponse {
+                        payment: Payment {
+                            amt_msat: payment_info.amt_msat,
+                            asset_amount,
+                            asset_id,
+                            payment_hash: hex_str(&payment_hash.0),
+                            payment_type,
+                            status: payment_info.status,
+                            created_at: payment_info.created_at,
+                            updated_at: payment_info.updated_at,
+                            payee_pubkey: payment_info.payee_pubkey.to_string(),
+                            preimage: payment_info.preimage.map(|p| hex_str(&p.0)),
+                            description: payment_info.description.clone(),
+                            description_hash: payment_info.description_hash.map(|h| hex_str(&h)),
+                        },
+                    }));
+                }
+            }
         }
-    }
+        PaymentType::Outbound => {
+            let outbound_payments = unlocked_state.outbound_payments();
 
-    for (payment_id, payment_info) in &outbound_payments {
-        let payment_hash = &PaymentHash(payment_id.0);
-        if payment_hash == &requested_ph {
-            let rgb_payment_info_path_outbound =
-                get_rgb_payment_info_path(payment_hash, &state.static_state.ldk_data_dir, false);
+            for (payment_id, payment_info) in &outbound_payments {
+                let payment_hash = &PaymentHash(payment_id.0);
+                if payment_hash == &requested_ph {
+                    let rgb_payment_info_path_outbound = get_rgb_payment_info_path(
+                        payment_hash,
+                        &state.static_state.ldk_data_dir,
+                        false,
+                    );
 
-            let (asset_amount, asset_id) = if rgb_payment_info_path_outbound.exists() {
-                let info = parse_rgb_payment_info(&rgb_payment_info_path_outbound);
-                (Some(info.amount), Some(info.contract_id.to_string()))
-            } else {
-                (None, None)
-            };
+                    let (asset_amount, asset_id) = if rgb_payment_info_path_outbound.exists() {
+                        let info = parse_rgb_payment_info(&rgb_payment_info_path_outbound);
+                        (Some(info.amount), Some(info.contract_id.to_string()))
+                    } else {
+                        (None, None)
+                    };
 
-            return Ok(Json(GetPaymentResponse {
-                payment: Payment {
-                    amt_msat: payment_info.amt_msat,
-                    asset_amount,
-                    asset_id,
-                    payment_hash: hex_str(&payment_hash.0),
-                    inbound: false,
-                    status: payment_info.status,
-                    created_at: payment_info.created_at,
-                    updated_at: payment_info.updated_at,
-                    payee_pubkey: payment_info.payee_pubkey.to_string(),
-                    preimage: payment_info.preimage.map(|p| hex_str(&p.0)),
-                    description: payment_info.description.clone(),
-                    description_hash: payment_info.description_hash.map(|h| hex_str(&h)),
-                },
-            }));
+                    return Ok(Json(GetPaymentResponse {
+                        payment: Payment {
+                            amt_msat: payment_info.amt_msat,
+                            asset_amount,
+                            asset_id,
+                            payment_hash: hex_str(&payment_hash.0),
+                            payment_type: PaymentType::Outbound,
+                            status: payment_info.status,
+                            created_at: payment_info.created_at,
+                            updated_at: payment_info.updated_at,
+                            payee_pubkey: payment_info.payee_pubkey.to_string(),
+                            preimage: payment_info.preimage.map(|p| hex_str(&p.0)),
+                            description: payment_info.description.clone(),
+                            description_hash: payment_info.description_hash.map(|h| hex_str(&h)),
+                        },
+                    }));
+                }
+            }
         }
     }
 
@@ -2863,7 +2891,7 @@ pub(crate) async fn list_payments(
             asset_amount,
             asset_id,
             payment_hash: hex_str(&payment_hash.0),
-            inbound: true,
+            payment_type: payment_type_from_invoice(payment_info.invoice_type.as_ref()),
             status: payment_info.status,
             created_at: payment_info.created_at,
             updated_at: payment_info.updated_at,
@@ -2892,7 +2920,7 @@ pub(crate) async fn list_payments(
             asset_amount,
             asset_id,
             payment_hash: hex_str(&payment_hash.0),
-            inbound: false,
+            payment_type: PaymentType::Outbound,
             status: payment_info.status,
             created_at: payment_info.created_at,
             updated_at: payment_info.updated_at,
