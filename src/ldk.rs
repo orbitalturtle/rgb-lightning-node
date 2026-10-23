@@ -167,6 +167,18 @@ pub(crate) static HELD_PAYMENT_CLAIMABLE_COUNT: AtomicUsize = AtomicUsize::new(0
 #[cfg(test)]
 pub(crate) static FORCE_PUSH_ASSET_AMOUNT_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
 
+// Test-only: make a HODL claim fail backwards after its persisted status has become Claiming.
+#[cfg(test)]
+pub(crate) static FAIL_HODL_CLAIM_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
+// Test-only: hold a HODL claim after persisting Claiming but before calling claim_funds.
+#[cfg(test)]
+pub(crate) static HOLD_HODL_CLAIM_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
+// Test-only: whether a HODL claim is currently held by HOLD_HODL_CLAIM_ON_NODE.
+#[cfg(test)]
+pub(crate) static HODL_CLAIM_HELD: AtomicBool = AtomicBool::new(false);
+
 // Test-only: whether the given override targets the node we are running as
 #[cfg(test)]
 pub(crate) fn node_override_matches(

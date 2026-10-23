@@ -80,7 +80,10 @@ use tokio::{
 };
 
 #[cfg(test)]
-use crate::ldk::{node_override_matches, FORCE_PUSH_ASSET_AMOUNT_ON_NODE};
+use crate::ldk::{
+    node_override_matches, FAIL_HODL_CLAIM_ON_NODE, FORCE_PUSH_ASSET_AMOUNT_ON_NODE,
+    HODL_CLAIM_HELD, HOLD_HODL_CLAIM_ON_NODE,
+};
 use crate::swap::{SwapData, SwapInfo, SwapString};
 use crate::utils::{
     check_already_initialized, check_channel_id, check_password_strength, check_password_validity,
@@ -1854,7 +1857,7 @@ pub(crate) async fn claim_hodl_invoice(
     WithRejection(Json(payload), _): WithRejection<Json<ClaimHodlInvoiceRequest>, APIError>,
 ) -> Result<Json<EmptyResponse>, APIError> {
     no_cancel(async move {
-        let (channel_manager, preimage) = {
+        let (channel_manager, _payment_hash, preimage) = {
             let guard = state.check_unlocked().await?;
             let unlocked_state = guard.as_ref().unwrap();
 
@@ -1890,9 +1893,39 @@ pub(crate) async fn claim_hodl_invoice(
             existing_payment_mut.updated_at = get_current_timestamp();
             unlocked_state.save_inbound_payments(inbound);
 
-            (unlocked_state.channel_manager.clone(), preimage)
+            (
+                unlocked_state.channel_manager.clone(),
+                payment_hash,
+                preimage,
+            )
         };
 
+        #[cfg(test)]
+        let payment_hash = _payment_hash;
+        #[cfg(test)]
+        let node_id = channel_manager.get_our_node_id();
+
+        #[cfg(test)]
+        if node_override_matches(&HOLD_HODL_CLAIM_ON_NODE, node_id) {
+            HODL_CLAIM_HELD.store(true, std::sync::atomic::Ordering::SeqCst);
+            let held_at = std::time::Instant::now();
+            while node_override_matches(&HOLD_HODL_CLAIM_ON_NODE, node_id) {
+                if held_at.elapsed() > Duration::from_secs(60) {
+                    panic!("TEST: HODL claim held for too long");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        #[cfg(test)]
+        if node_override_matches(&FAIL_HODL_CLAIM_ON_NODE, node_id) {
+            tracing::info!("TEST: failing HODL claim backwards for payment {payment_hash}");
+            channel_manager.fail_htlc_backwards(&payment_hash);
+        } else {
+            channel_manager.claim_funds(preimage);
+        }
+
+        #[cfg(not(test))]
         channel_manager.claim_funds(preimage);
 
         Ok(Json(EmptyResponse {}))
