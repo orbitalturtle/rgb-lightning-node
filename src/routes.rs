@@ -2968,8 +2968,11 @@ pub(crate) async fn ln_invoice(
         let guard = state.check_unlocked().await?;
         let unlocked_state = guard.as_ref().unwrap();
 
-        let contract_id = if let Some(asset_id) = payload.asset_id {
-            Some(ContractId::from_str(&asset_id).map_err(|_| APIError::InvalidAssetID(asset_id))?)
+        let contract_id = if let Some(asset_id) = &payload.asset_id {
+            Some(
+                ContractId::from_str(asset_id)
+                    .map_err(|_| APIError::InvalidAssetID(asset_id.clone()))?,
+            )
         } else {
             None
         };
@@ -3011,13 +3014,10 @@ pub(crate) async fn ln_invoice(
             ..Default::default()
         };
 
-        let invoice = match unlocked_state
+        let invoice = unlocked_state
             .channel_manager
             .create_bolt11_invoice(invoice_params)
-        {
-            Ok(inv) => inv,
-            Err(e) => return Err(APIError::FailedInvoiceCreation(e.to_string())),
-        };
+            .map_err(|e| APIError::FailedInvoiceCreation(e.to_string()))?;
 
         let payment_hash = PaymentHash((*invoice.payment_hash()).to_byte_array());
         let created_at = get_current_timestamp();
