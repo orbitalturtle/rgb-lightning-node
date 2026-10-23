@@ -716,6 +716,7 @@ paths:
       description: >-
         Get a LN invoice to receive a payment. The description and
         description_hash fields are mutually exclusive.
+        Provide `min_final_cltv_expiry_delta` to request an explicit inbound final CLTV policy.
       requestBody:
         content:
           application/json:
@@ -1731,6 +1732,7 @@ components:
         - payment_hash
         - payment_secret
         - network
+        - min_final_cltv_expiry_delta
       properties:
         amt_msat:
           type:
@@ -1776,6 +1778,9 @@ components:
           example: 0343851df9e0e8aff0c10b3498ce723ff4c9b4a855e6c8819adcafbbb3e24ea2af
         network:
           $ref: '#/components/schemas/BitcoinNetwork'
+        min_final_cltv_expiry_delta:
+          type: integer
+          example: 144
     DecodeRGBInvoiceRequest:
       type: object
       required:
@@ -2512,6 +2517,9 @@ components:
             - string
             - 'null'
           example: 5ca5d81b482b4015e7b14df7a27fe0a38c226273604ffd3b008b752571811938
+        min_final_cltv_expiry_delta:
+          type: integer
+          example: 144
     LNInvoiceResponse:
       type: object
       required:

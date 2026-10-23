@@ -23,6 +23,7 @@ async fn invoice() {
         asset_amount: Some(1),
         description: None,
         description_hash: None,
+        min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node1_addr}/lninvoice"))
@@ -40,6 +41,7 @@ async fn invoice() {
         asset_amount: Some(1),
         description: None,
         description_hash: None,
+        min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node1_addr}/lninvoice"))
@@ -57,6 +59,7 @@ async fn invoice() {
         asset_amount: None,
         description: None,
         description_hash: None,
+        min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node1_addr}/lninvoice"))
@@ -70,6 +73,10 @@ async fn invoice() {
 
     // an invoice with a description should carry it as the BOLT11 d tag
     let description = "1 cup of coffee";
+
+    // check that the invoice preserves the custom min_final_cltv_expiry_delta
+    let requested_min_final_cltv_expiry_delta = 144;
+
     let payload = LNInvoiceRequest {
         amt_msat: None,
         expiry_sec: 900,
@@ -77,6 +84,7 @@ async fn invoice() {
         asset_amount: None,
         description: Some(description.to_string()),
         description_hash: None,
+        min_final_cltv_expiry_delta: Some(requested_min_final_cltv_expiry_delta),
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node1_addr}/lninvoice"))
@@ -93,6 +101,10 @@ async fn invoice() {
         lightning_invoice::Bolt11InvoiceDescriptionRef::Direct(d) if d.to_string() == description
     ));
     let decoded = decode_ln_invoice(node1_addr, &res.invoice).await;
+    assert_eq!(
+        decoded.min_final_cltv_expiry_delta,
+        u64::from(requested_min_final_cltv_expiry_delta) + 3
+    );
     assert_eq!(decoded.description.as_deref(), Some(description));
     assert_eq!(decoded.description_hash, None);
     let payment = list_payments(node1_addr)
@@ -112,6 +124,7 @@ async fn invoice() {
         asset_amount: None,
         description: None,
         description_hash: Some(description_hash.0.to_string()),
+        min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node1_addr}/lninvoice"))
@@ -152,6 +165,7 @@ async fn invoice() {
         asset_amount: None,
         description: Some(description.to_string()),
         description_hash: Some(description_hash.0.to_string()),
+        min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node1_addr}/lninvoice"))
@@ -175,6 +189,7 @@ async fn invoice() {
         asset_amount: None,
         description: None,
         description_hash: Some(s!("not-a-valid-description-hash")),
+        min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node1_addr}/lninvoice"))
@@ -198,6 +213,7 @@ async fn invoice() {
         asset_amount: None,
         description: Some("a".repeat(640)),
         description_hash: None,
+        min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node1_addr}/lninvoice"))
@@ -252,6 +268,7 @@ async fn zero_amount_invoice() {
         asset_amount: None,
         description: None,
         description_hash: None,
+        min_final_cltv_expiry_delta: None,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node2_addr}/lninvoice"))
@@ -334,6 +351,7 @@ async fn zero_amount_invoice() {
         asset_amount: None,
         description: None,
         description_hash: None,
+        min_final_cltv_expiry_delta: None,
     };
     let invoice_without_amount = reqwest::Client::new()
         .post(format!("http://{node2_addr}/lninvoice"))
@@ -358,6 +376,7 @@ async fn zero_amount_invoice() {
         asset_amount: Some(50),
         description: None,
         description_hash: None,
+        min_final_cltv_expiry_delta: None,
     };
     let invoice_with_amount = reqwest::Client::new()
         .post(format!("http://{node2_addr}/lninvoice"))

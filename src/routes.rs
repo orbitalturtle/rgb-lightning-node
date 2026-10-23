@@ -531,6 +531,7 @@ pub(crate) struct DecodeLNInvoiceResponse {
     pub(crate) payment_secret: String,
     pub(crate) payee_pubkey: Option<String>,
     pub(crate) network: BitcoinNetwork,
+    pub(crate) min_final_cltv_expiry_delta: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -894,6 +895,7 @@ pub(crate) struct LNInvoiceRequest {
     pub(crate) asset_amount: Option<u64>,
     pub(crate) description: Option<String>,
     pub(crate) description_hash: Option<String>,
+    pub(crate) min_final_cltv_expiry_delta: Option<u16>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1926,6 +1928,7 @@ pub(crate) async fn decode_ln_invoice(
         payment_secret: hex_str(&invoice.payment_secret().0),
         payee_pubkey: invoice.payee_pub_key().map(|p| p.to_string()),
         network: invoice.network().into(),
+        min_final_cltv_expiry_delta: invoice.min_final_cltv_expiry_delta(),
     }))
 }
 
@@ -3010,6 +3013,7 @@ pub(crate) async fn ln_invoice(
             amount_msats: payload.amt_msat,
             description,
             invoice_expiry_delta_secs: Some(payload.expiry_sec),
+            min_final_cltv_expiry_delta: payload.min_final_cltv_expiry_delta,
             contract_id,
             asset_amount: payload.asset_amount,
             ..Default::default()
